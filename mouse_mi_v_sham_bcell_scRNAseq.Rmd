@@ -1,0 +1,299 @@
+---
+title: "Jana_PostMI_SingleCell"
+author: "Carolina"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+#Prep
+
+Loading Packages
+```{r}
+library("Seurat")
+library(dplyr)
+library(patchwork)
+library(R.utils)
+library(ggplot2)
+library("HGNChelper")
+library("openxlsx")
+#library("ggraph")
+library("igraph")
+#library("tidyverse")
+library("data.tree")
+library("biomaRt")
+```
+
+Load h5 file that was downloaded off of cellranger. This loads both the gene expression (scRNAseq) and antibody capture (hashtags) objects into a list
+```{r}
+
+setwd(dir="~/scratch4-mmugnie1/carolina/Luigi_B_Cells/Partek")
+h5_files <- list.files(pattern =  "*h5")
+jana.data <- lapply(h5_files, Read10X_h5)
+h5_seurat <- lapply(jana.data, CreateSeuratObject)
+postMI  <- merge(h5_seurat[[1]], y = h5_seurat[2:length(h5_seurat)], 
+                  add.cell.ids = c("1b",  "3b","5b","1h",  "3h","5h","1s",  "3s","5s"), project = "jana_post_MI")
+```
+
+
+
+Set up seurat object with RNA data. Take a quick look at metadata
+```{r}
+postMI.meta=postMI@meta.data
+head(postMI.meta)
+```
+
+
+We need a column in metadata that indicates the tissue type 
+```{r}
+postMI.meta$tissue = ""
+
+postMI.meta$temp= substr(rownames(postMI.meta), 2, 2)
+
+
+postMI.meta=postMI.meta %>%
+  mutate(tissue = case_when(
+    startsWith(temp, "b") ~ "Blood",
+    startsWith(temp, "h") ~ "Heart",
+    startsWith(temp, "s") ~ "Spleen"
+    ))
+
+postMI$tissue=postMI.meta$tissue
+
+postMI$condition=""
+
+postMI.meta=postMI.meta %>%
+  mutate(condition = case_when(
+    startsWith(rownames(postMI.meta), "1") ~ "sham",
+
+    startsWith(rownames(postMI.meta), "3") ~ "Recent_MI",
+
+    startsWith(rownames(postMI.meta), "5") ~ "Heart_Failure"
+
+    ))
+
+postMI$condition=postMI.meta$condition
+
+
+
+postMI.meta=postMI@meta.data
+```
+
+
+# Process the data sets
+*1. Quality check*  
+
+```{r}
+
+Idents(postMI)=postMI$tissue
+postMI[["percent.mt"]] <- PercentageFeatureSet(postMI, pattern = "^mt-",assay="RNA") 
+
+VlnPlot(postMI, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(postMI, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(postMI, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+*2. filter out very low and very high expression and very high mitochondrial genes:*  
+Based on the distribution of  data I am going to filter out mitochondrial genes >8%, and unique features <200 (already did this when I loaded but I'll do it again to be safe) and > 3800 for heart, >3500 for spleen, and >3200 for blood
+
+```{r}
+#split by tissue type
+tissue.list= SplitObject(postMI, split.by = "tissue")
+
+
+tissue.list[[1]]=subset(tissue.list[[1]], subset = nFeature_RNA > 200 & nFeature_RNA < 3200 & percent.mt < 8)
+tissue.list[[2]]=subset(tissue.list[[2]], subset = nFeature_RNA > 200 & nFeature_RNA < 3800 & percent.mt < 8)
+tissue.list[[3]]=subset(tissue.list[[3]], subset = nFeature_RNA > 200 & nFeature_RNA < 3500 & percent.mt < 8)
+```
+
+
+*3. Normalize and Scale*  
+
+```{r}
+tissue.list <- lapply(X = tissue.list, FUN = function(x) {
+x <- NormalizeData(x, normalization.method = "LogNormalize", scale.factor = 10000)
+x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+all.genes <- rownames(x)
+x <- ScaleData(x, features = all.genes)  
+  
+
+})
+```
+
+
+# Clustering
+
+## PCA
+where the elbow plot forms the "elbow" ie. where it levels out, will help you determine how many dimensions to use. Aim on the higher end
+```{r}
+tissue.list <- lapply(X = tissue.list, FUN = function(x) {
+     x <- RunPCA(x, verbose = FALSE)})
+#showing just the one for heart here
+ElbowPlot(tissue.list[[2]])
+```
+
+## UMAP
+```{r}
+tissue.list <- lapply(X = tissue.list, FUN = function(x) {
+    x <- RunUMAP(x, reduction = "pca", dims = 1:15, verbose = FALSE)
+    x <- FindNeighbors(x, reduction = "pca", dims = 1:15)
+    x <- FindClusters(x,resolution = 0.15) #*****was 0.07 before when I did the ImmGen
+})
+
+for (i in 1:length(tissue.list)) {
+  print(DimPlot(tissue.list[[i]], reduction = "umap", group.by="condition",label = TRUE,
+    repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i])))
+    print(DimPlot(tissue.list[[i]], reduction = "umap", split.by="condition",label = TRUE,
+    repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i])))
+
+```
+
+
+# Sc-Type 
+since these are mice, we need to convert to human gene symbols for scType to work well. 
+```{r, eval=FALSE}
+mouse = data.frame("names"=rownames(postMI))
+
+require("biomaRt")
+humanMart = useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host="https://dec2021.archive.ensembl.org/")
+mouseMart = useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+
+genesV2 = getLDS(attributes = c("mgi_symbol"), filters = "mgi_symbol", values = mouse$names , mart = mouseMart, attributesL = c("hgnc_symbol"), martL = humanMart)
+#humanx<- unique(genesV2[, 2])
+humanx <- genesV2[!duplicated(genesV2$MGI.symbol), ]
+
+
+library("tibble")
+
+human=data.frame("MGI.symbol"=rownames(postMI))
+
+human =  human %>% 
+  left_join(humanx, by="MGI.symbol")
+
+human =  human %>%
+  mutate(HGNC.symbol= ifelse(is.na(HGNC.symbol),MGI.symbol,HGNC.symbol))
+
+for (i in 1:length(tissue.list)) {
+rownames(tissue.list[[i]]@assays$RNA@counts) <- human$HGNC.symbol
+rownames(tissue.list[[i]]$RNA@data) <- human$HGNC.symbol
+}
+```
+
+Load necessary functions for scType
+```{r}
+#scType gene set preparation function and annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R"); source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+```
+
+
+Will use our own B cell marker data. This data was based on the expression markers from the following papers
+
+[Yang S, et al (2021) Frontiers in Immunology](https://www.frontiersin.org/articles/10.3389/fimmu.2021.711980/full). 
+
+[Lee RD, et al (2021) Nat. Comm.](https://www.nature.com/articles/s41467-021-27232-5). 
+
+[Laidlaw et al (2020) Nat. Immunology](https://www.nature.com/articles/s41590-020-0713-6). 
+
+[Nguyen HTT, et al (2021) Plos Pathogens](https://journals.plos.org/plospathogens/article?id=10.1371/journal.ppat.1010026). 
+
+[Battacharya D, et al (2007) JImmunol.](https://journals.aai.org/jimmunol/article/179/10/6808/75654). 
+
+[Kin NW, et al (2008) JImmunol](https://journals.plos.org/plospathogens/article?id=10.1371/journal.ppat.1010026). 
+
+```{r}
+# other tissues: Immune system, Pancreas, Liver, Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen, Stomach, Thymus
+library(readxl)
+
+#I am editing 
+
+DB = "/home/cduque1/scratch4-mmugnie1/carolina/Luigi_B_Cells/ScTypeDB_Carolina_edited_Bcell.xlsx"
+
+
+Immune_gs_list=gene_sets_prepare(DB,"Immune system")
+
+```
+
+```{r}
+for (i in 1:length(tissue.list)) {
+#create cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = tissue.list[[i]][["RNA"]]@scale.data, scaled = TRUE, 
+                      gs = Immune_gs_list$gs_positive, gs2 = Immune_gs_list$gs_negative)
+
+# merge by cluster
+assign(paste("cL_results",names(tissue.list)[i],sep = "_"), do.call("rbind", 
+                     lapply(unique(tissue.list[[i]]@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[,rownames(tissue.list[[i]]@meta.data[tissue.list[[i]]@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(tissue.list[[i]]@meta.data$seurat_clusters==cl)), 10)
+}))
+)
+es.max =""
+}
+
+for (i in 1:length(tissue.list)) {
+assign(paste("sctype_scores",names(tissue.list)[i],sep = "_"), eval(parse(text=paste("cL_results",names(tissue.list)[i],sep = "_"))) %>% group_by(cluster) %>% top_n(n = 1, wt = scores))
+  }
+
+ # set low-confident (low ScType score) clusters to "unknown"
+sctype_scores_Blood$type[as.numeric(as.character(sctype_scores_Blood$scores)) < sctype_scores_Blood$ncells/10] = "Unknown"
+
+sctype_scores_Heart$type[as.numeric(as.character(sctype_scores_Heart$scores)) < sctype_scores_Heart$ncells/10] = "Unknown"
+
+
+sctype_scores_Spleen$type[as.numeric(as.character(sctype_scores_Spleen$scores)) < sctype_scores_Spleen$ncells/10] = "Unknown"
+
+
+for (i in 1:length(tissue.list)) {
+tissue.list[[i]]@meta.data$scType_immune = ""
+}
+
+for(j in unique(sctype_scores_Blood$cluster)){
+  cl_type = sctype_scores_Blood[sctype_scores_Blood$cluster==j,]; 
+  tissue.list[[1]]@meta.data$scType_immune[tissue.list[[1]]@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+for(j in unique(sctype_scores_Heart$cluster)){
+  cl_type = sctype_scores_Heart[sctype_scores_Heart$cluster==j,]; 
+  tissue.list[[2]]@meta.data$scType_immune[tissue.list[[2]]@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+for(j in unique(sctype_scores_Spleen$cluster)){
+  cl_type = sctype_scores_Spleen[sctype_scores_Spleen$cluster==j,]; 
+  tissue.list[[3]]@meta.data$scType_immune[tissue.list[[3]]@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+for (i in 1:length(tissue.list)) {
+  print(DimPlot(tissue.list[[i]], reduction = "umap", group.by="scType_immune",label = TRUE,
+    repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i])))}
+
+sctype_scores_Blood
+sctype_scores_Heart
+sctype_scores_Spleen
+
+
+#Manually change Memory B cell in heart to memory-like B cells
+tissue.list[[2]]@meta.data=tissue.list[[2]]@meta.data %>%
+  mutate(scType_immune = ifelse(
+    scType_immune=="Memory B cells",
+    "Memory-like B cells", scType_immune))
+
+for (i in 1:length(tissue.list)) {
+  x=DimPlot(tissue.list[[i]], reduction = "umap", group.by="scType_immune",label = TRUE,
+    repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i]))
+  print(x)
+  ggsave(plot=x,filename=paste0("~/scratch4-mmugnie1/carolina/Luigi_B_Cells/umap_Jana_Blood_scType_",names(tissue.list)[i],".svg"),width=7)
+}
+
+for (i in 1:length(tissue.list)) {
+  x=DimPlot(tissue.list[[i]], reduction = "umap", group.by="scType_immune",split.by = "condition",label = TRUE,
+    repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i]))
+  print(x)
+  ggsave(plot=x,filename=paste0("~/scratch4-mmugnie1/carolina/Luigi_B_Cells/umap_Jana_Blood_scType_Sex_Treatment_",names(tissue.list)[i],".svg"),width=15)
+}
+
+```
+
