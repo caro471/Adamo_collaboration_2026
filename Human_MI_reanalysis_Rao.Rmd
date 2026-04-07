@@ -52,7 +52,7 @@ library("Matrix")
 
 read in their CellRanger? data
 ```{r}
-data_dir <- "~/scratch4-mmugnie1/carolina/Luigi_B_Cells/Jana_Infarct_paper/raw/cellranger"
+data_dir <- "raw/cellranger"
 list_dir <- list.files(data_dir,pattern =  "*barcodes.tsv.gz")
 sample_ID <- gsub(".*_(.+)_.*", "\\1", list_dir)
 GSE145154_10X <- Read10X_GEO(data_dir =data_dir)
@@ -197,7 +197,7 @@ We used an edited cell marker database
 * geneSymbolmore2 - marker genes not expected to be expressed by a cell type)  
 
 ```{r}
-DB = "/home/cduque1/scratch4-mmugnie1/carolina/Luigi_B_Cells/ScTypeDB_Carolina_edited.xlsx"
+DB = "ScTypeDB_Carolina_edited.xlsx"
 
 Immune_gs_list = gene_sets_prepare(DB, c("Immune system") )
 
@@ -244,6 +244,7 @@ sub_blood_MI@meta.data=sub_blood_MI@meta.data %>%
 
 Idents(object = sub_blood_MI) <- "scType_Immune_edited"
 DimPlot(sub_blood_MI, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune_edited', split.by = "disease", cols = c("#ff6666","grey"))
-ggsave("~/UMAP_blood_scType_disease_simplified.svg",width = 12.5,height=6.5)
+ggsave("UMAP_blood_scType_disease_simplified.svg",width = 12.5,height=6.5)
 ```
+
 
