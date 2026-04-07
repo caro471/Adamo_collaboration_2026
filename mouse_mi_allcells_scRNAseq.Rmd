@@ -1,0 +1,352 @@
+---
+title: "postMI_allcells"
+author: "Carolina Duque"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+
+#Prep
+
+Loading Packages
+```{r}
+library("Seurat")
+library(dplyr)
+library(patchwork)
+library(R.utils)
+library(ggplot2)
+library("HGNChelper")
+library("openxlsx")
+library("igraph")
+library("data.tree")
+library("biomaRt")
+```
+
+
+
+# Setup   
+ 
+Loading h5 file from cellranger output.
+```{r,message = FALSE, warning=FALSE}
+set.seed(1234)
+setwd(dir="Jana_MI_allCells_round2")
+h5_files <- list.files(pattern =  "*filtered_feature_bc_matrix.h5", recursive = TRUE, full.names = TRUE)
+list_h5_data <- lapply(h5_files, Read10X_h5)
+
+names(list_h5_data) <- sub("^.*/(.*)_final/per.*", "\\1", h5_files)
+
+
+h5_seurat_list <- lapply(X=list_h5_data, FUN=function(x) {CreateSeuratObject(counts = x$`Gene Expression`)})
+all_cells_seurat  <- merge(h5_seurat_list[[1]], y = h5_seurat_list[2:length(h5_seurat_list)], 
+                  add.cell.ids = c("hash1","hash2","hash6"), project = "jana_Bcell_MI_mice_2")
+```
+
+create metadata
+```{r}
+all_cells_metadata=all_cells_seurat@meta.data
+
+all_cells_metadata$hashtag=gsub("^(.*)_.*$", "\\1", rownames(all_cells_metadata))
+
+all_cells_metadata <- all_cells_metadata %>%
+  mutate(condition = case_when(hashtag=="hash1" ~ "WT_MI",
+                               hashtag=="hash2" ~ "MHC_KO_MI",
+                               hashtag=="hash6" ~ "WT_sham"))
+
+all_cells_seurat <- AddMetaData(all_cells_seurat, metadata = all_cells_metadata)
+
+```
+
+
+
+# Process the data sets 
+  
+*1. Quality check*   
+  
+```{r}
+
+Idents(all_cells_seurat)=all_cells_seurat$condition
+all_cells_seurat[["percent.mt"]] <- PercentageFeatureSet(all_cells_seurat, pattern = "^mt-",assay="RNA") 
+
+VlnPlot(all_cells_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(all_cells_seurat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(all_cells_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+VlnPlot(all_cells_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size=0,split.by = "condition")
+
+```  
+
+doublet finder. doublet rate for new GEM-X is 0.04% per 1000 cells. Looking at the assignment_confidence_table there were 43152 cells recovered of which 4146 were unassigned / blank and 7190 were doublets (16.6%). Based on 43152 cells recovered we would expect 17.2% doublets. hashtag would presumably find 1/2 of the doublets given that there are 3 hashtags in this case (ie it found 1-2,1-6,2-6 doublets but not 1-1, 2-2, 6-6)). i think to be conservative i will say an expected doublet rate of 17.2% /2 = 8.6%
+
+```{r}
+all_cells_seurat <- JoinLayers(all_cells_seurat)
+
+library(scDblFinder)
+set.seed(12345)
+all_cells_seurat.sce <- as.SingleCellExperiment(all_cells_seurat)
+set.seed(12345)
+all_cells_seurat.sce <- scDblFinder(all_cells_seurat.sce, dbr = 0.086)
+all_cells_seurat = as.Seurat(all_cells_seurat.sce, data = NULL)
+all_cells_metadata=all_cells_seurat@meta.data
+```
+
+
+*2. filter out very low and very high expression and very high mitochondrial genes:*  
+  
+Based on the distribution of your data I am going to filter out mitochondrial genes >10%, and unique features <200  and > 4800
+
+
+```{r}
+all_cells_seurat <- subset(all_cells_seurat, subset = nFeature_RNA > 200 & nFeature_RNA < 4800 & percent.mt < 10 & scDblFinder.class =="singlet")
+
+VlnPlot(all_cells_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size=0,split.by = "condition")
+```
+
+```{r}
+table(all_cells_seurat$condition)
+```
+
+
+*3. Normalize and Scale*  
+```{r}
+all_cells_seurat <-NormalizeData(all_cells_seurat, normalization.method = "LogNormalize", scale.factor = 10000) %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 3000) 
+all.genes <- rownames(all_cells_seurat)
+all_cells_seurat <- ScaleData(all_cells_seurat, features = all.genes)  
+```
+
+there is just one pool so no need to remove batch effects
+
+```{r}
+set.seed(12345)
+all_cells_seurat <- RunPCA(all_cells_seurat, verbose = FALSE) %>% 
+  RunUMAP(reduction = "pca", dims = 1:30, verbose = FALSE) %>% 
+  FindNeighbors(reduction = "pca", dims = 1:30)
+
+set.seed(12345)
+all_cells_seurat<-FindClusters(
+  all_cells_seurat,
+  resolution = 0.5
+)
+
+DimPlot(all_cells_seurat, reduction = "umap",raster = FALSE, group.by = "condition")
+```
+
+
+# scType
+
+Load necessary functions for scType
+```{r}
+#scType gene set preparation function and annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R"); source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+```
+
+since these are mice, we need to convert to human gene symbols for scType to work well.
+
+```{r}
+mouse = data.frame("names"=rownames(all_cells_seurat))
+mouse = data.frame(mouse$names[1:10])
+require("biomaRt")
+
+humanMart = useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host="https://jul2023.archive.ensembl.org")
+mouseMart = useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl", host ="https://jul2023.archive.ensembl.org")
+
+#getLDS is not working. might be a connection issue, so i just grabbed it from the biomart website. upload below
+human_mouse=read.csv("mouse_human_symbol_mart_export.txt")
+genesV2=human_mouse
+genesV2 = genesV2 %>%
+  dplyr::rename("HGNC.symbol"="Human.gene.name",
+         "MGI.symbol"="Gene.name")
+genesV2$Human.gene.stable.ID <- NULL
+
+humanx <- genesV2[!duplicated(genesV2$MGI.symbol), ]
+
+
+library("tibble")
+
+human=data.frame("MGI.symbol"=rownames(all_cells_seurat))
+human$order = 1:nrow(human)
+
+human =  human %>% 
+  left_join(humanx, by="MGI.symbol")
+
+human =  human %>%
+  mutate(HGNC.symbol_edit= ifelse(HGNC.symbol=="",MGI.symbol,HGNC.symbol))
+
+human =human[order(human$order), ]
+
+  
+rownames(all_cells_seurat) <- human$HGNC.symbol_edit
+```
+
+
+Will use our own T cell marker data since scType markers are designed for human. This data was based on the expression markers from the following papers and from cellmarker 2.0
+
+- see B cell and T cell analyses for those papers
+- https://www.cell.com/iscience/fulltext/S2589-0042(23)01836-9
+- https://www.ahajournals.org/doi/full/10.1161/CIRCULATIONAHA.119.045115
+- [Kimmel J, et al (2019) Genome Res.](https://genome.cshlp.org/content/29/12/2088)
+- Forte et all.  https://www.cell.com/cell-reports/fulltext/S2211-1247(20)30162-5?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2211124720301625%3Fshowall%3Dtrue 
+- [cellmarker 2.0](http://bio-bigdata.hrbmu.edu.cn/CellMarker/)
+
+
+```{r}
+set.seed(12345)
+DB = "scType_CD_edited_heart_immune.xlsx"
+
+Immune_gs_list = gene_sets_prepare(DB, c("Immune system") )
+
+#create cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = GetAssayData(all_cells_seurat, slot = "scale.data", assay = "RNA"), scaled = TRUE, 
+                      gs = Immune_gs_list$gs_positive, gs2 = Immune_gs_list$gs_negative) 
+
+# merge by cluster
+cL_resutls = do.call("rbind", 
+                     lapply(unique(all_cells_seurat@meta.data$seurat_cluster), function(cl){
+    es.max.cl = sort(rowSums(es.max[,rownames(all_cells_seurat@meta.data[all_cells_seurat@meta.data$seurat_cluster==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(all_cells_seurat@meta.data$seurat_cluster==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/5] = "Unknown"
+print(sctype_scores[,1:3])
+
+
+all_cells_seurat@meta.data$scType_Immune = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  all_cells_seurat@meta.data$scType_Immune[all_cells_seurat@meta.data$seurat_cluster == j] = as.character(cl_type$type[1])
+}
+
+Idents(object = all_cells_seurat) <- "scType_Immune"
+```
+
+```{r}
+Idents(object = all_cells_seurat) <- "scType_Immune"
+DimPlot(all_cells_seurat, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune', raster = FALSE,label.size = 2.5)
+
+```
+
+
+```{r,  fig.width=15, fig.height =6 }
+Idents(object = all_cells_seurat) <- "scType_Immune"
+DimPlot(all_cells_seurat, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune', split.by = "condition",raster = FALSE,label.size = 4.5) + ggtitle("scType_annotations") + theme(legend.text = element_text(size = 10))
+ggsave("UMAP_scType_Jana_MI_allcells_round2.pdf",width = 15,height=6)
+```
+
+
+# DGE
+
+switch back to mouse genes
+```{r}
+rownames(all_cells_seurat@assays$RNA) <- human$MGI.symbol
+```
+
+
+so we don't have biological replicates, so wouldn't be possible to aggregate expression and then run DESeq since it would involve comparing 1 sample vs 1 sample
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+library(GGally)
+library(DESeq2)
+library(ggfortify)
+library(plotly)
+#library(glmGamPoi)
+library(BiocParallel)
+
+all_cells_seurat$condition = factor(all_cells_seurat$condition, levels = c("WT_sham","WT_MI","MHC_KO_MI"))
+
+all_cells_seurat@meta.data=all_cells_seurat@meta.data %>%
+  mutate(celltype.cond = paste(scType_Immune_edited,condition, sep="_"))
+all_cells_seurat@meta.data=all_cells_seurat@meta.data %>%
+  mutate(specificcelltype.cond = paste(scType_Immune,condition, sep="_"))
+```
+
+running into this error so need to adjust count matrix as in the chunk bellow
+Error in estimateSizeFactorsForMatrix(counts(object), locfunc = locfunc,  : 
+  every gene contains at least one zero, cannot compute log geometric means
+```{r, eval=FALSE}
+genes_to_keep <- rowSums(all_cells_seurat@assays$RNA$counts > 1) >= 10 # genes expressed (count > 1) in at least 10 cells
+features_keep=rownames(all_cells_seurat)[genes_to_keep]
+
+all_cells_seurat_deseq=all_cells_seurat
+all_cells_seurat_deseq <- subset(all_cells_seurat, features = features_keep)
+
+all_cells_seurat_deseq <- subset(all_cells_seurat_deseq, subset = scType_Immune_edited!="Unknown")
+
+all_cells_seurat_deseq@assays$RNA@counts<-as.matrix(all_cells_seurat_deseq@assays$RNA@counts)+1
+```
+
+
+for summarized cell types
+
+```{r, eval=FALSE}
+summarized_cell_types = unique(all_cells_seurat@meta.data$scType_Immune_edited)
+summarized_cell_types = setdiff(summarized_cell_types,"Unknown")
+summarized_cell_types_seurat <- list()
+
+
+
+# Loop over summarized cell types and create subsets
+for (x in summarized_cell_types) {
+  summarized_cell_types_seurat[[paste(x, "seurat", sep = "_")]] <- subset(all_cells_seurat_deseq, subset = scType_Immune_edited == x)
+}
+
+
+
+
+dds_summarized_list <- list()
+
+for (x in summarized_cell_types) {
+ seurat_name <- paste(x, "seurat", sep = "_")
+ seurat_obj <- summarized_cell_types_seurat[[seurat_name]]
+ 
+ seurat_obj$celltype.cond = factor(seurat_obj$celltype.cond, levels = c(paste(x, "WT_sham", sep = "_"),paste(x, "WT_MI", sep = "_"),paste(x, "MHC_KO_MI", sep = "_")))
+set.seed(12345)
+dds_summarized_list[[paste(x, "dds", sep = "_")]] <- DESeqDataSetFromMatrix(seurat_obj@assays$RNA$counts,
+                              colData = seurat_obj@meta.data, 
+                              design = ~ celltype.cond)
+}
+
+for (x in seq_along(dds_summarized_list)) {
+  
+  set.seed(12345)
+  dds_summarized_list[[x]] <- DESeq(
+    dds_summarized_list[[x]], 
+    useT = TRUE, 
+    minmu = 1e-6, 
+    minReplicatesForReplace = Inf
+  )
+}
+
+
+summarized_ddsResults <- list()
+for (x in summarized_cell_types) {
+  dds_name <- paste(x, "dds", sep = "_")
+ dds_obj <- dds_summarized_list[[dds_name]]
+ 
+summarized_ddsResults[[paste(x,"WT_MI_v_Sham",sep="_")]] <- results(dds_obj, 
+                               contrast = c("celltype.cond",paste(x,"WT_MI",sep="_"),paste(x,"WT_sham",sep="_")))
+
+summarized_ddsResults[[paste(x,"KO_MI_v_Sham",sep="_")]] <- results(dds_obj, 
+                               contrast = c("celltype.cond",paste(x,"MHC_KO_MI",sep="_"),paste(x,"WT_sham",sep="_")))
+
+summarized_ddsResults[[paste(x,"KO_MI_v_WT_MI",sep="_")]] <- results(dds_obj, 
+                               contrast = c("celltype.cond",paste(x,"MHC_KO_MI",sep="_"),paste(x,"WT_MI",sep="_")))
+}
+
+
+names(summarized_ddsResults) <- gsub("/", "_", names(summarized_ddsResults))
+names(summarized_ddsResults) <- gsub(" ", "_", names(summarized_ddsResults))
+
+for (i in seq_along(summarized_ddsResults)) {
+  name_result <- names(summarized_ddsResults)[i]
+  write.csv(as.data.frame(summarized_ddsResults[i]),paste0("DEG/",name_result,".csv"))
+}
+```
