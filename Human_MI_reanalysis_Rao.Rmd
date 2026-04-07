@@ -1,0 +1,249 @@
+---
+title: "Human_MI_reanalysis_Rao"
+author: "Carolian Duque"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+the [Resolving the intertwining of inflammation and fibrosis in human heart failure at single-cell level](https://link.springer.com/article/10.1007/s00395-021-00897-1#Sec20) paper contains
+
+LV - left ventricle 
+RV - right ventricle 
+P - CD45+
+N - CD45-
+Bld - blood
+
+for ICM patients: 
+MI - LV infarcted miocardium
+NMI - LV non-infarced miocardium 
+
+** They should have 2 normal samples and 3 dcm samples, but they seem to only have normal_1 up and DCM_2 and DCM_3 up on GEO
+
+RM sampels are CD3+ so only T cells. They used for TCR sequencing
+The rest are bulk RNA seq
+
+
+# Setup
+Loading Packages
+```{r}
+library("Seurat")
+library("ScCustomize")
+library(dplyr)
+library(patchwork)
+library(R.utils)
+library(ggplot2)
+library("HGNChelper")
+library("openxlsx")
+#library("ggraph")
+library("igraph")
+#library("tidyverse")
+library("data.tree")
+library("biomaRt")
+library("cli")
+library("pbapply")
+library("Matrix")
+```
+
+
+read in their CellRanger? data
+```{r}
+data_dir <- "~/scratch4-mmugnie1/carolina/Luigi_B_Cells/Jana_Infarct_paper/raw/cellranger"
+list_dir <- list.files(data_dir,pattern =  "*barcodes.tsv.gz")
+sample_ID <- gsub(".*_(.+)_.*", "\\1", list_dir)
+GSE145154_10X <- Read10X_GEO(data_dir =data_dir)
+# this makes a list of matrices (single modality data)
+SeuratSet_GEO <- lapply(GSE145154_10X, CreateSeuratObject)
+GEO_MI_dataset <- merge(SeuratSet_GEO[[1]], y = SeuratSet_GEO[2:length(SeuratSet_GEO)], add.cell.ids = sample_ID, project = "GEO_MI")
+```
+
+Extract metadata
+```{r}
+metadata_GEO_MI_dataset <- GEO_MI_dataset@meta.data
+```
+
+update metadata with clinical data as per in overview informaton
+```{r}
+metadata_GEO_MI_dataset$tissue = ""
+metadata_GEO_MI_dataset$condition = ""
+metadata_GEO_MI_dataset$disease = ""
+metadata_GEO_MI_dataset$Enrichment = ""
+
+metadata_GEO_MI_dataset$temp= sub("_.*", "", rownames(metadata_GEO_MI_dataset))
+
+metadata_GEO_MI_dataset=metadata_GEO_MI_dataset %>%
+  mutate(disease = case_when(
+    startsWith(temp, "N") ~ "Normal",
+    startsWith(temp, "DCM") ~ "DCM",
+    startsWith(temp, "ICM") ~ "ICM"
+    ))
+
+metadata_GEO_MI_dataset=metadata_GEO_MI_dataset %>%
+  mutate(Enrichment = case_when(
+    endsWith(temp, "N") ~ "CD45-",
+    endsWith(temp, "P") ~ "CD45+",
+    grepl("Bld", temp) ~ "CD45+"
+    ))
+
+metadata_GEO_MI_dataset=metadata_GEO_MI_dataset %>%
+  mutate(tissue = case_when(
+    grepl("LV", temp) ~ "LV",
+    grepl("RV", temp) ~ "RV",
+    grepl("MI", temp) ~ "LV",
+    grepl("Bld", temp) ~ "Blood"
+  ))
+
+metadata_GEO_MI_dataset=metadata_GEO_MI_dataset %>%
+  mutate(condition = case_when(
+    grepl("-MI", temp) ~ "Infarcted",
+    grepl("-NMI", temp) ~ "Non-infarcted",
+    (disease=="ICM" & grepl("LV", temp)) ~ "Infarcted",
+    (disease=="ICM" & grepl("RV", temp)) ~ "Non-infarcted",
+    TRUE ~ "Not-ICM"
+  ))
+
+GEO_MI_dataset <- AddMetaData(GEO_MI_dataset, metadata = metadata_GEO_MI_dataset)
+```
+
+subset database to ICM and Normal blood
+```{r}
+sub_blood_MI = subset(x = GEO_MI_dataset, subset = tissue == "Blood" & disease != "DCM" )
+
+metadata_sub_blood_MI = sub_blood_MI@meta.data
+```
+
+# Process the data sets
+*1. Quality check*  
+* very low # of unique genes or total # of molecules detected can represent low quality cells or empty droplets
+* very high # of unique genes or total # of molecules detected can represent doublets (hastag demultiplexing helps with this)
+* very high # of mitochondrial genes can indicate dying or low quality cells  
+```{r}
+
+sub_blood_MI[["percent.mt"]] <- PercentageFeatureSet(sub_blood_MI, pattern = "^MT-",assay="RNA")
+VlnPlot(sub_blood_MI, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sub_blood_MI, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sub_blood_MI, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+*filter out very low and very high expression and very high mitochondrial genes:*  
+```{r}
+
+
+sub_blood_MI.sce <- as.SingleCellExperiment(sub_blood_MI)
+sub_blood_MI.sce <- scDblFinder(sub_blood_MI.sce, samples="temp")
+sub_blood_MI = as.Seurat(sub_blood_MI.sce)
+test=sub_blood_MI@meta.data
+sub_blood_MI <- subset(sub_blood_MI, subset = nFeature_RNA > 200 & percent.mt < 5 & scDblFinder.class=="singlet")
+
+```
+
+*Normalize and Scale*  
+Since we did the regular seurat normalization strategy for the mouse data, we will do the same here. 
+
+```{r}
+sub_blood_MI <-NormalizeData(sub_blood_MI, normalization.method = "LogNormalize", scale.factor = 10000) %>% 
+  FindVariableFeatures(selection.method = "vst", nfeatures = 3000) 
+all.genes <- rownames(sub_blood_MI)
+sub_blood_MI <- ScaleData(sub_blood_MI, features = all.genes)  
+```
+
+*Integrate Datasets*
+This dataset has evident batch effects, and appears to be by sample (at least visually). Since I don't know their batches, I will use sample ID as the batch. 
+
+Harmony needs a pca
+```{r}
+sub_blood_MI <- RunPCA(sub_blood_MI, verbose = FALSE)
+ElbowPlot(sub_blood_MI)
+```
+
+```{r}
+library("harmony")
+sub_blood_MI <- RunHarmony(sub_blood_MI, "temp")
+```
+
+
+# Clustering
+
+
+## UMAP
+resolution parameter sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters. Generally resultion is 0.4-1.2, and optimal resolution often increases for larger datasets
+```{r}
+sub_blood_MI <- RunUMAP(sub_blood_MI, reduction = "harmony", dims = 1:30, verbose = FALSE) %>% FindNeighbors(reduction = "harmony", dims = 1:30)
+
+sub_blood_MI<-FindClusters(
+  sub_blood_MI,
+  resolution = 0.5
+)
+```
+
+# scType
+
+Load necessary functions for scType
+```{r}
+#scType gene set preparation function and annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R"); source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+```
+
+
+We used an edited cell marker database
+* tissueType - tissue type
+* cellName - cell type
+* geneSymbolmore1 - positive marker genes
+* geneSymbolmore2 - marker genes not expected to be expressed by a cell type)  
+
+```{r}
+DB = "/home/cduque1/scratch4-mmugnie1/carolina/Luigi_B_Cells/ScTypeDB_Carolina_edited.xlsx"
+
+Immune_gs_list = gene_sets_prepare(DB, c("Immune system") )
+
+#create cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = sub_blood_MI[["RNA"]]@scale.data, scaled = TRUE, 
+                      gs = Immune_gs_list$gs_positive, gs2 = Immune_gs_list$gs_negative) 
+
+# merge by cluster
+cL_resutls = do.call("rbind", 
+                     lapply(unique(sub_blood_MI@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[,rownames(sub_blood_MI@meta.data[sub_blood_MI@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(sub_blood_MI@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] = "Unknown"
+print(sctype_scores[,1:3])
+
+sub_blood_MI@meta.data$scType_Immune = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  sub_blood_MI@meta.data$scType_Immune[sub_blood_MI@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+Idents(object = sub_blood_MI) <- "scType_Immune"
+
+DimPlot(sub_blood_MI, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune')
+
+DimPlot(sub_blood_MI, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune', split.by = "disease")
+
+```
+make simplified version of the UMAP with only the B cells shown and everything else in grey: 
+
+```{r}
+sub_blood_MI@meta.data$scType_Immune_edited = sub_blood_MI@meta.data$scType_Immune
+
+sub_blood_MI@meta.data=sub_blood_MI@meta.data %>%
+  mutate(scType_Immune_edited = case_when(
+    scType_Immune_edited=="Plasma B cells"|scType_Immune_edited=="Naive B cells"|scType_Immune_edited=="Pre-B cells" ~ "B Cells",
+    scType_Immune_edited!="B Cells" ~ "Other Immune Cells"
+  ))
+
+Idents(object = sub_blood_MI) <- "scType_Immune_edited"
+DimPlot(sub_blood_MI, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_Immune_edited', split.by = "disease", cols = c("#ff6666","grey"))
+ggsave("~/UMAP_blood_scType_disease_simplified.svg",width = 12.5,height=6.5)
+```
+
