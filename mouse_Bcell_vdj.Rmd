@@ -1,0 +1,261 @@
+---
+title: "mouse_MI_bcell_clonotype"
+author: "Carolina Duque"
+date: "`r Sys.Date()`"
+output: html_document
+---
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+#Prep
+
+Loading Packages
+```{r}
+library("Seurat")
+library(dplyr)
+library(patchwork)
+library(R.utils)
+library(ggplot2)
+library("HGNChelper")
+library("openxlsx")
+library("igraph")
+library("data.tree")
+library("biomaRt")
+library(scRepertoire)
+library(devEMF)
+```
+
+
+# clonotype analysis
+
+```{r}
+load("mouse_bcell_postMI_seuratobj.RDa")
+```
+
+
+load contig annotations. 
+
+```{r,message = FALSE, warning=FALSE}
+setwd(dir="Jana_MI_BCells_b_h_s/VDJ")
+contig_files <- list.files(pattern =  "*filtered_contig_annotations.csv", recursive = TRUE, full.names = TRUE)
+list_contig <- lapply(contig_files, read.csv)
+
+names(list_contig) <- sub(".*/(.*)\\/filtered_contig_annotations\\.csv$", "\\1", contig_files)
+```
+
+i need to get the barcodes to match the ones in the seurat object for downstream merging
+
+```{r}
+for (i in seq_along(tissue.list)) {
+  colnames(tissue.list[[i]]) <- sub("^[0-9]+", "", colnames(tissue.list[[i]]))
+}
+
+prefix.map <- c(Blood = "b_", Heart = "h_", Spleen = "s_")
+
+# Loop through and update barcodes
+for (name in names(list_contig)) {
+  list_contig[[name]]$barcode <- paste0(prefix.map[name], list_contig[[name]]$barcode)
+}
+```
+
+
+
+
+```{r}
+
+combined.BCR.list <- list()
+
+
+for (i in seq_along(list_contig)) {
+  tissue <- names(list_contig)[i]
+  
+  seurat <- tissue.list[[i]]
+  
+  sample.contig.list <- createHTOContigList(list_contig[[i]], 
+                                   seurat, 
+                                   group.by = "condition")
+
+
+  combined.BCR.list[[tissue]] <- combineBCR(
+    sample.contig.list, 
+    samples = c("M_sham","F_Sham","M_Recent_MI","F_Recent_MI","M_Old_MI","F_Old_MI"), 
+    threshold = 0.85,
+    removeNA = TRUE
+  )
+}
+
+
+```
+
+```{r}
+for (i in seq_along(combined.BCR.list)) {
+  name <- names(combined.BCR.list)[i]
+  
+  for (x in seq_along(combined.BCR.list[[i]])){
+    sub_name <- names(combined.BCR.list[[i]])[x]
+    df <- combined.BCR.list[[i]][[x]]
+    df$barcode <- sub(".*(?=b_|h_|s_)", "", df$barcode, perl = TRUE)
+    combined.BCR.list[[name]][[sub_name]] <- df
+    }
+}
+```
+
+
+
+combine with seurat object
+
+
+```{r, fig.width=9.5, fig.asp=0.4}
+
+tissue.list.bcr = list()
+
+for (i in seq_along(tissue.list)) {
+  tissue <- names(tissue.list)[i]
+  BCR <- combined.BCR.list[[i]]
+  seurat <- tissue.list[[i]]
+  
+tissue.list.bcr[[tissue]] <- combineExpression(BCR, 
+                                   seurat, 
+                                   cloneCall="strict", 
+                                   chain = "both",
+                                   group.by = "sample", 
+                                   proportion = FALSE,
+                                   cloneSize=c(Single=1, Small=5, Medium=20, Large=100, Hyperexpanded=500),
+                                   filterNA = FALSE)
+
+}
+```
+```{r}
+colorblind_vector <- hcl.colors(n=7, palette = "inferno", fixup = TRUE)
+
+for (i in seq_along(tissue.list)){
+  tissue <- names(tissue.list)[i]
+  
+p<-Seurat::DimPlot(tissue.list.bcr[[i]], group.by = "cloneSize",reduction = "umap", alpha = ifelse(is.na(tissue.list.bcr[[i]]$cloneSize), 0.04, 1)) +
+    scale_color_manual(values=rev(colorblind_vector[c(7,4,2)])) +  
+  theme(axis.text.x = element_text(size=8),axis.text.y = element_text(size=8), legend.text=element_text(size=10), axis.title=element_text(size=12)) + 
+  labs(title = paste(tissue))
+print(p)
+
+emf(file = paste0("svg/",tissue,"_vdj_seurat_M.emf"), width = 6, height = 4)
+print(p)   # your ggplot object
+dev.off()
+  
+}
+
+```
+
+
+```{r}
+
+B_clono_freq <- list()  # make sure it exists
+
+for (i in seq_along(tissue.list.bcr)) {
+  tissue <- names(tissue.list.bcr)[i]  # or however you define 'tissue'
+  
+  meta_df <- tissue.list.bcr[[i]]@meta.data
+  
+  B_clono_freq[[tissue]] <- meta_df %>%
+    filter(!is.na(CTstrict) & CTstrict != "") %>%
+    dplyr::count(condition, CTstrict, name = "n_cells") %>%
+    arrange(desc(n_cells))
+}
+
+library(scales)
+
+cond_colors <- c("#800020","#b51b20","#499e36","#c94d0e","#e6b815","#368e9e")
+conditions <- sort(unique(tissue.list.bcr[[1]]@meta.data$condition))
+
+```
+
+```{r}
+
+B_clono_freq_M = list()
+
+
+for (i in seq_along(tissue.list)) {
+  tissue <- names(tissue.list)[i]
+  
+  B_clono_freq_M[[tissue]] <- B_clono_freq[[i]] %>%
+    dplyr::filter(grepl("^M_", condition))  # keep rows where condition starts with "M_"
+}
+
+
+```
+
+```{r}
+
+
+for (i in seq_along(tissue.list)){
+  tissue <- names(tissue.list)[i]
+# Select the top 10
+top10_M_ids <- B_clono_freq_M[[i]] %>%
+  group_by(condition) %>%
+  slice_max(order_by = n_cells, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+top10_M <- subset(B_clono_freq_M[[i]], CTstrict %in% top10_M_ids$CTstrict)
+
+  total_counts <- top10_M %>%
+    group_by(CTstrict) %>%
+    summarise(total_clones = sum(n_cells)) %>%
+    arrange(desc(total_clones))
+  
+top10_M$CTstrict <- factor(top10_M$CTstrict, levels = total_counts$CTstrict)
+
+
+# Plot
+p<-ggplot(top10_M, aes(x = CTstrict, y = n_cells, fill=condition)) +
+  geom_col() +
+  scale_fill_manual(values = cond_colors,
+                    breaks = conditions)+
+  scale_y_continuous(breaks = pretty_breaks()) +
+  labs(
+    x = "Clonotype",
+    y = "Number of clones",
+    title = "Top 15 most abundant clonotypes"
+  ) + labs(title = paste(tissue)) + theme_classic() + theme(axis.text.x = element_blank())
+
+
+print(p)
+
+emf(file = paste0("svg/",tissue,"_all_v_sham_top15_clonotypes_M.emf"), width = 6, height = 4)
+print(p)   # your ggplot object
+dev.off()
+
+}
+
+```
+
+quantify clones
+```{r}
+
+for (i in seq_along(tissue.list)){
+  tissue <- names(tissue.list)[i]
+table(tissue.list.bcr[[i]]@meta.data$condition)
+
+tissue.list.bcr.male<-lapply(tissue.list.bcr, function(x) {subset(x, Sex == "Male")})
+
+p<-clonalQuant(tissue.list.bcr.male[[i]], 
+            cloneCall="strict", 
+            chain = "both",
+            group.by = "condition",
+            scale = TRUE)+ labs(title = paste(tissue)) + scale_fill_manual(values = cond_colors,
+                    breaks = conditions)
+
+print(p)
+emf(file = paste0("~/scratch4-mmugnie1/carolina/Luigi_B_Cells/Jana_MI_BCells_b_h_s/svg/",tissue,"_percent_unique_clones_M.emf"), width = 6, height = 4)
+print(p)   # your ggplot object
+dev.off()
+
+
+}
+```
+
+
+
+
