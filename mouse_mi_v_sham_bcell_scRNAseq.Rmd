@@ -211,7 +211,7 @@ library(readxl)
 
 #I am editing 
 
-DB = "/home/cduque1/scratch4-mmugnie1/carolina/Luigi_B_Cells/ScTypeDB_Carolina_edited_Bcell.xlsx"
+DB = "ScTypeDB_Carolina_edited_Bcell.xlsx"
 
 
 Immune_gs_list=gene_sets_prepare(DB,"Immune system")
@@ -285,14 +285,14 @@ for (i in 1:length(tissue.list)) {
   x=DimPlot(tissue.list[[i]], reduction = "umap", group.by="scType_immune",label = TRUE,
     repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i]))
   print(x)
-  ggsave(plot=x,filename=paste0("~/scratch4-mmugnie1/carolina/Luigi_B_Cells/umap_Jana_Blood_scType_",names(tissue.list)[i],".svg"),width=7)
+  ggsave(plot=x,filename=paste0("~/umap_Jana_Blood_scType_",names(tissue.list)[i],".svg"),width=7)
 }
 
 for (i in 1:length(tissue.list)) {
   x=DimPlot(tissue.list[[i]], reduction = "umap", group.by="scType_immune",split.by = "condition",label = TRUE,
     repel = TRUE)+ ggtitle(paste0(names(tissue.list)[i]))
   print(x)
-  ggsave(plot=x,filename=paste0("~/scratch4-mmugnie1/carolina/Luigi_B_Cells/umap_Jana_Blood_scType_Sex_Treatment_",names(tissue.list)[i],".svg"),width=15)
+  ggsave(plot=x,filename=paste0("~/umap_Jana_Blood_scType_Sex_Treatment_",names(tissue.list)[i],".svg"),width=15)
 }
 
 ```
