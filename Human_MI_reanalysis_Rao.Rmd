@@ -248,3 +248,76 @@ ggsave("UMAP_blood_scType_disease_simplified.svg",width = 12.5,height=6.5)
 ```
 
 
+# DGE
+
+use AggregateExpression() to sum together gene counts of all the cells from the same sample for each cell type. This results in one gene expression profile per sample and cell type. We can then perform DE analysis using DESeq2 on the sample level. This treats the samples, rather than the individual cells, as independent observations.
+  
+aggregate expression and clean up metadata
+```{r, message=FALSE}
+pseudo_MI_blood <- AggregateExpression(sub_blood_MI, assays = "RNA",slot ="counts", return.seurat = T, group.by = c("temp", "scType_Immune_edited"))
+
+# gather metadata 
+pseudo_MI_blood_metadata=pseudo_MI_blood@meta.data
+
+pseudo_MI_blood_metadata$temp = as.character(pseudo_MI_blood_metadata$orig.ident)
+
+pseudo_MI_blood_metadata=pseudo_MI_blood_metadata %>%
+  mutate(disease = case_when(
+    startsWith(temp, "N") ~ "Normal",
+    startsWith(temp, "DCM") ~ "DCM",
+    startsWith(temp, "ICM") ~ "ICM"
+    ))
+
+
+
+pseudo_MI_blood_metadata$scType_Immune_edited <- sapply(strsplit(Cells(pseudo_MI_blood), split = "_"), function(x) paste(x[2:length(x)], collapse = "_"))
+
+pseudo_MI_blood_metadata$celltype.disease <- paste(pseudo_MI_blood_metadata$scType_Immune_edited, pseudo_MI_blood_metadata$disease, sep = "_")
+
+
+
+temp_metadata=sub_blood_MI@meta.data
+temp_metadata=subset(temp_metadata, select=c("temp","disease"))
+temp_metadata=unique(temp_metadata)
+
+pseudo_MI_blood_metadata$ROWNAMES=rownames(pseudo_MI_blood_metadata)
+pseudo_MI_blood_metadata$row_order  <- 1:nrow(pseudo_MI_blood_metadata)
+
+pseudo_MI_blood_metadata = merge(pseudo_MI_blood_metadata,temp_metadata,by=c("temp","disease"),all.x=TRUE)
+rownames(pseudo_MI_blood_metadata)=pseudo_MI_blood_metadata$ROWNAMES
+pseudo_MI_blood_metadata =pseudo_MI_blood_metadata[order(pseudo_MI_blood_metadata$row_order), ]
+
+
+# add back the metadata to the seurat object
+pseudo_MI_blood=AddMetaData(pseudo_MI_blood,metadata = pseudo_MI_blood_metadata)
+
+
+# subset to only B and T cells to make the sparse matrix smaller
+#pseudo_MI_blood=subset(pseudo_MI_blood,scType_Immune_edited=="B Cells")
+
+
+pseudo_MI_blood_metadata=pseudo_MI_blood@meta.data
+```
+
+
+Run DESeq2
+
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+dds_pseudo_MI_blood=DESeqDataSetFromMatrix(pseudo_MI_blood@assays$RNA@counts, 
+                              colData = pseudo_MI_blood_metadata, 
+                              design = ~ celltype.disease)
+
+
+dds_pseudo_MI_blood <- DESeq(dds_pseudo_MI_blood)
+
+res_ICM_v_Normal_blood <- results(dds_pseudo_MI_blood, 
+               contrast = c("celltype.disease","B Cells_ICM","B Cells_Normal"),
+               alpha = 0.05)
+
+summary(res_ICM_v_Normal_blood)
+
+write.csv(as.data.frame(res_ICM_v_Normal_blood),"~/DESEq_ICM_V_norm.csv")
+```
+
+
